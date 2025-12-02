@@ -19,7 +19,8 @@ data class TextChunk(
 )
 
 class DocumentLoader(
-    private val allowedExtensions: Set<String> = setOf("md", "txt", "json", "kt", "java", "kts"),
+    private val allowedExtensions: Set<String> = setOf("md", "txt", "json", "kt", "kts", "java", "js", "ts"),
+    private val maxFileSizeBytes: Long = 512 * 1024,
 ) {
 
     fun loadSources(selectedPath: Path): RagLoadResult {
@@ -58,7 +59,16 @@ class DocumentLoader(
         if (docsRoot.isDirectory()) {
             Files.walk(docsRoot).use { stream ->
                 stream.filter { path ->
-                    path.isRegularFile() && allowedExtensions.contains(path.extension.lowercase())
+                    path.isRegularFile() && shouldInclude(path)
+                }.forEach { files.add(it) }
+            }
+        }
+
+        val srcDir = selection.resolve("src")
+        if (srcDir.isDirectory()) {
+            Files.walk(srcDir).use { stream ->
+                stream.filter { path ->
+                    path.isRegularFile() && shouldInclude(path)
                 }.forEach { files.add(it) }
             }
         }
@@ -71,12 +81,17 @@ class DocumentLoader(
 
         if (files.isEmpty()) {
             Files.walk(selection, 2).use { stream ->
-                stream.filter { it.isRegularFile() && allowedExtensions.contains(it.extension.lowercase()) }
+                stream.filter { it.isRegularFile() && shouldInclude(it) }
                     .forEach { files.add(it) }
             }
         }
 
         return files.toList()
+    }
+
+    private fun shouldInclude(path: Path): Boolean {
+        if (!allowedExtensions.contains(path.extension.lowercase())) return false
+        return runCatching { Files.size(path) <= maxFileSizeBytes }.getOrElse { false }
     }
 
     private fun labelFor(root: Path?, target: Path): String {

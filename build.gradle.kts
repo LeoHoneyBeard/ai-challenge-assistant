@@ -1,3 +1,5 @@
+import org.gradle.api.tasks.JavaExec
+
 plugins {
     kotlin("jvm") version "1.9.23"
     id("org.jetbrains.compose") version "1.6.11"
@@ -49,4 +51,12 @@ compose.desktop {
             packageVersion = "1.0.0"
         }
     }
+}
+
+tasks.register<JavaExec>("prReview") {
+    group = "application"
+    description = "Runs the headless pull-request review CLI"
+    mainClass.set("com.aichallenge.assistant.ci.PullRequestReviewCliKt")
+    classpath = sourceSets["main"].runtimeClasspath
+    standardInput = System.`in`
 }
