@@ -1,5 +1,6 @@
 package com.aichallenge.assistant.service
 
+import com.aichallenge.assistant.integrations.GithubRepoRef
 import com.aichallenge.assistant.integrations.McpGitClient
 import com.aichallenge.assistant.integrations.OllamaClient
 import com.aichallenge.assistant.integrations.OllamaMessage
@@ -235,6 +236,13 @@ class AssistantController(
         response.onSuccess { log("REVIEW", "Review completed for PR #$prNumber") }
         response.onFailure { log("REVIEW", "Review failed for PR #$prNumber: ${it.message}") }
         return response
+    }
+
+    suspend fun detectRepository(projectRoot: Path?): Result<GithubRepoRef> {
+        val root = projectRoot ?: return Result.failure(IllegalStateException("Project path is not selected"))
+        return mcpGitClient.detectGithubRepo(root).mapCatching { repo ->
+            repo ?: error("Unable to detect git remote for the selected project.")
+        }
     }
 
     fun describeProject(root: Path, question: String?): String =
