@@ -18,6 +18,11 @@ data class McpGithubSettings(
     val apiUrl: String?,
 )
 
+data class GithubWebhookSettings(
+    val port: Int,
+    val secret: String?,
+)
+
 object LocalPropertiesConfig {
     private val properties: Properties? by lazy { loadProperties() }
 
@@ -33,6 +38,13 @@ object LocalPropertiesConfig {
             repo = repo,
             apiUrl = apiUrl,
         )
+    }
+
+    fun webhookSettings(): GithubWebhookSettings? {
+        val portValue = properties?.valueOrNull("github.webhook.port") ?: envValue("GITHUB_WEBHOOK_PORT")
+        val port = portValue?.toIntOrNull() ?: return null
+        val secret = properties?.valueOrNull("github.webhook.secret") ?: envValue("GITHUB_WEBHOOK_SECRET")
+        return GithubWebhookSettings(port = port, secret = secret)
     }
 
     private fun loadProperties(): Properties? {

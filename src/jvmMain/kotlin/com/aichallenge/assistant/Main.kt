@@ -40,6 +40,7 @@ import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Switch
 import androidx.compose.runtime.*
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.key.onPreviewKeyEvent
@@ -57,6 +58,9 @@ import androidx.compose.ui.window.application
 import java.io.FileDescriptor
 import java.io.FileOutputStream
 import java.io.PrintStream
+import com.aichallenge.assistant.integrations.GithubRepoRef
+import com.aichallenge.assistant.integrations.GithubWebhookServer
+import com.aichallenge.assistant.mcp.LocalPropertiesConfig
 import com.aichallenge.assistant.mcp.McpServerState
 import com.aichallenge.assistant.model.ChatMessage
 import com.aichallenge.assistant.model.MessageRole
@@ -65,6 +69,7 @@ import com.aichallenge.assistant.model.RagStatus
 import com.aichallenge.assistant.service.AssistantController
 import com.aichallenge.assistant.service.SettingsStore
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.nio.file.Files
 import java.nio.file.Path
@@ -125,6 +130,13 @@ private fun AssistantScreen() {
     var isReviewingPr by remember { mutableStateOf(false) }
     var lastReviewedPr by remember { mutableStateOf<PullRequestSummary?>(null) }
     var lastReviewText by remember { mutableStateOf<String?>(null) }
+    var autoReviewEnabled by remember { mutableStateOf(false) }
+    var autoReviewStatus by remember { mutableStateOf("Auto review is disabled.") }
+    val autoReviewMarks = remember { mutableStateMapOf<Int, String>() }
+    var webhookEnabled by remember { mutableStateOf(false) }
+    var webhookStatus by remember { mutableStateOf("Webhook listener disabled.") }
+    val webhookServerState = remember { mutableStateOf<GithubWebhookServer?>(null) }
+    var currentRepoRef by remember { mutableStateOf<GithubRepoRef?>(null) }
 
     fun updateMcpServers(servers: List<McpServerState>) {
         mcpServers.clear()
@@ -175,6 +187,36 @@ private fun AssistantScreen() {
         }
     }
 
+    suspend fun performPullRequestReview(pr: PullRequestSummary, updateStatus: Boolean = false): Result<String> {
+        if (!isReviewingPr) {
+            isReviewingPr = true
+        }
+        val result = controller.reviewPullRequest(
+            prNumber = pr.number,
+            baseUrl = baseUrl,
+            chatModel = selectedChatModel,
+            embeddingModel = selectedEmbeddingModel,
+            projectRoot = projectPath,
+        )
+        result.onSuccess { review ->
+            lastReviewedPr = pr
+            lastReviewText = review
+            autoReviewMarks[pr.number] = pr.updatedAt
+        }.onFailure { error ->
+            lastReviewedPr = pr
+            lastReviewText = "Review failed: ${error.message}"
+        }
+        if (updateStatus) {
+            result.onSuccess {
+                status = "Review ready for PR #${pr.number}"
+            }.onFailure { error ->
+                status = "Review failed: ${error.message}"
+            }
+        }
+        isReviewingPr = false
+        return result
+    }
+
     fun runPullRequestReview(pr: PullRequestSummary) {
         scope.launch {
             if (projectPath == null) {
@@ -183,23 +225,7 @@ private fun AssistantScreen() {
             }
             isReviewingPr = true
             status = "Reviewing PR #${pr.number}..."
-            val result = controller.reviewPullRequest(
-                prNumber = pr.number,
-                baseUrl = baseUrl,
-                chatModel = selectedChatModel,
-                embeddingModel = selectedEmbeddingModel,
-                projectRoot = projectPath,
-            )
-            result.onSuccess { review ->
-                lastReviewedPr = pr
-                lastReviewText = review
-                status = "Review ready for PR #${pr.number}"
-            }.onFailure { error ->
-                lastReviewedPr = pr
-                lastReviewText = "Review failed: ${error.message}"
-                status = "Review failed: ${error.message}"
-            }
-            isReviewingPr = false
+            performPullRequestReview(pr, updateStatus = true)
         }
     }
 
@@ -360,6 +386,22 @@ private fun AssistantScreen() {
                             isReviewing = isReviewingPr,
                             reviewedPr = lastReviewedPr,
                             reviewText = lastReviewText,
+                            autoReviewEnabled = autoReviewEnabled,
+                            autoReviewStatus = autoReviewStatus,
+                            webhookEnabled = webhookEnabled,
+                            webhookStatus = webhookStatus,
+                            onToggleAutoReview = { enabled ->
+                                autoReviewEnabled = enabled
+                                if (!enabled) {
+                                    autoReviewStatus = "Auto review is disabled."
+                                }
+                            },
+                            onToggleWebhook = { enabled ->
+                                webhookEnabled = enabled
+                                if (!enabled) {
+                                    webhookStatus = "Webhook listener disabled."
+                                }
+                            },
                             onRefresh = { refreshPullRequests() },
                             onReview = { pr -> runPullRequestReview(pr) },
                         )
@@ -375,6 +417,115 @@ private fun AssistantScreen() {
 
     LaunchedEffect(projectPath) {
         loadPullRequests()
+    }
+
+    LaunchedEffect(autoReviewEnabled, projectPath, baseUrl, selectedChatModel, selectedEmbeddingModel) {
+        if (!autoReviewEnabled) {
+            autoReviewStatus = "Auto review is disabled."
+            return@LaunchedEffect
+        }
+        val root = projectPath
+        if (root == null) {
+            autoReviewStatus = "Select a project to enable auto review."
+            return@LaunchedEffect
+        }
+        autoReviewStatus = "Auto review is active."
+        while (autoReviewEnabled && projectPath != null) {
+            autoReviewStatus = "Checking pull requests..."
+            val result = controller.listPullRequests(projectPath)
+            result.onSuccess { prs ->
+                val next = prs.firstOrNull { pr ->
+                    val marker = autoReviewMarks[pr.number]
+                    marker == null || marker != pr.updatedAt
+                }
+                if (next != null) {
+                    autoReviewStatus = "Reviewing PR #${next.number}..."
+                    val reviewResult = performPullRequestReview(next)
+                    reviewResult.onSuccess {
+                        autoReviewStatus = "Auto-reviewed PR #${next.number}"
+                    }.onFailure { error ->
+                        autoReviewStatus = "Auto review failed: ${error.message}"
+                    }
+                } else {
+                    autoReviewStatus = "Auto review idle (no changes)."
+                }
+            }.onFailure { error ->
+                autoReviewStatus = "Auto review failed to load PRs: ${error.message}"
+            }
+            delay(60_000)
+        }
+    }
+
+    LaunchedEffect(webhookEnabled, projectPath, currentRepoRef) {
+        if (!webhookEnabled) {
+            webhookServerState.value?.stop()
+            webhookServerState.value = null
+            webhookStatus = "Webhook listener disabled."
+            return@LaunchedEffect
+        }
+        val settings = LocalPropertiesConfig.webhookSettings()
+        if (settings == null) {
+            webhookStatus = "Webhook settings are missing. Define github.webhook.port and github.webhook.secret."
+            webhookEnabled = false
+            return@LaunchedEffect
+        }
+        try {
+            val server = GithubWebhookServer(
+                port = settings.port,
+                secret = settings.secret,
+                scope = scope,
+            ) { event ->
+                val repo = currentRepoRef
+                if (repo == null) {
+                    webhookStatus = "Webhook ignored: repository not detected for current project."
+                    return@GithubWebhookServer
+                }
+                if (!(repo.owner.equals(event.owner, ignoreCase = true) && repo.repo.equals(event.repo, ignoreCase = true))) {
+                    webhookStatus = "Webhook ignored: event for ${event.owner}/${event.repo}."
+                    return@GithubWebhookServer
+                }
+                if (projectPath == null) {
+                    webhookStatus = "Webhook ignored: project path not selected."
+                    return@GithubWebhookServer
+                }
+                scope.launch {
+                    webhookStatus = "Webhook: reviewing PR #${event.number}"
+                    loadPullRequests()
+                    val pr = pullRequests.firstOrNull { it.number == event.number }
+                    if (pr == null) {
+                        webhookStatus = "Webhook: PR #${event.number} not found after refresh."
+                    } else {
+                        val result = performPullRequestReview(pr, updateStatus = false)
+                        webhookStatus = if (result.isSuccess) {
+                            "Webhook: review ready for PR #${pr.number}"
+                        } else {
+                            "Webhook: review failed - ${result.exceptionOrNull()?.message}"
+                        }
+                    }
+                }
+            }
+            server.start()
+            webhookServerState.value = server
+            webhookStatus = "Listening for GitHub App webhooks on port ${settings.port}."
+        } catch (error: Exception) {
+            webhookStatus = "Failed to start webhook server: ${error.message}"
+            webhookEnabled = false
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            webhookServerState.value?.stop()
+        }
+    }
+
+    LaunchedEffect(projectPath) {
+        if (projectPath == null) {
+            currentRepoRef = null
+        } else {
+            val result = controller.detectRepository(projectPath)
+            currentRepoRef = result.getOrNull()
+        }
     }
 
     LaunchedEffect(initialSettings.lastProject) {
@@ -675,177 +826,110 @@ private fun McpTabContent(
 
 @Composable
 private fun PullRequestTabContent(
-
     pullRequests: List<PullRequestSummary>,
-
     status: String,
-
     isLoading: Boolean,
-
     isReviewing: Boolean,
-
     reviewedPr: PullRequestSummary?,
-
     reviewText: String?,
-
+    autoReviewEnabled: Boolean,
+    autoReviewStatus: String,
+    webhookEnabled: Boolean,
+    webhookStatus: String,
+    onToggleAutoReview: (Boolean) -> Unit,
+    onToggleWebhook: (Boolean) -> Unit,
     onRefresh: () -> Unit,
-
     onReview: (PullRequestSummary) -> Unit,
-
 ) {
-
     Column(Modifier.fillMaxSize()) {
-
         Row(verticalAlignment = Alignment.CenterVertically) {
-
             Text("Open pull requests", style = MaterialTheme.typography.titleMedium)
-
             Spacer(Modifier.weight(1f))
-
-            Button(onClick = onRefresh, enabled = !isLoading) {
-
+            Button(onClick = onRefresh, enabled = !isLoading && !isReviewing) {
                 Text("Refresh")
-
             }
-
         }
-
         Spacer(Modifier.height(8.dp))
-
         Text(status, style = MaterialTheme.typography.bodySmall)
-
-        if (isLoading) {
-
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Auto review pull requests", style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.weight(1f))
+            Switch(checked = autoReviewEnabled, onCheckedChange = onToggleAutoReview, enabled = !isReviewing)
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(autoReviewStatus, style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("GitHub App webhook listener", style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.weight(1f))
+            Switch(checked = webhookEnabled, onCheckedChange = onToggleWebhook, enabled = !isReviewing)
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(webhookStatus, style = MaterialTheme.typography.bodySmall)
+        if (isLoading || isReviewing) {
             Spacer(Modifier.height(12.dp))
-
             CircularProgressIndicator(modifier = Modifier.size(32.dp))
-
         }
-
         Spacer(Modifier.height(12.dp))
-
         Row(Modifier.fillMaxSize()) {
-
             Column(Modifier.weight(1f)) {
-
                 if (pullRequests.isEmpty()) {
-
                     Text("No pull requests to display.", style = MaterialTheme.typography.bodyMedium)
-
                 } else {
-
                     LazyColumn {
-
                         items(pullRequests) { pr ->
-
                             Card(
-
                                 modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
-
                                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-
                             ) {
-
                                 Column(Modifier.padding(12.dp)) {
-
-                                    Text(
-
-                                        "#${pr.number} ${pr.title}",
-
-                                        style = MaterialTheme.typography.titleSmall,
-
-                                    )
-
+                                    Text("#${pr.number} ${pr.title}", style = MaterialTheme.typography.titleSmall)
                                     Spacer(Modifier.height(4.dp))
-
                                     Text(
-
-                                        "Author: ${pr.author} | Branches: ${pr.headBranch} > ${pr.baseBranch}",
-
+                                        "Author: ${pr.author} | Branches: ${pr.headBranch} → ${pr.baseBranch}",
                                         style = MaterialTheme.typography.bodySmall,
-
                                     )
-
                                     Spacer(Modifier.height(4.dp))
-
                                     Text(
-
                                         "Files: ${pr.changedFiles} (+${pr.additions}/-${pr.deletions})",
-
                                         style = MaterialTheme.typography.bodySmall,
-
                                     )
-
                                     Spacer(Modifier.height(4.dp))
-
                                     Row(verticalAlignment = Alignment.CenterVertically) {
-
                                         Text("Updated: ${pr.updatedAt}", style = MaterialTheme.typography.bodySmall)
-
                                         Spacer(Modifier.weight(1f))
-
                                         Button(onClick = { onReview(pr) }, enabled = !isReviewing) {
-
                                             Text(if (isReviewing) "Reviewing..." else "Review")
-
                                         }
-
                                     }
-
                                 }
-
                             }
-
                         }
-
                     }
-
                 }
-
             }
-
             Spacer(Modifier.width(16.dp))
-
             Column(
-
                 modifier = Modifier.weight(1f).fillMaxHeight()
-
                     .background(MaterialTheme.colorScheme.surfaceVariant)
-
                     .padding(12.dp),
-
             ) {
-
                 val title = reviewedPr?.let { "#${it.number} ${it.title}" } ?: "No review yet"
-
                 Text("Review output", style = MaterialTheme.typography.titleMedium)
-
                 Spacer(Modifier.height(4.dp))
-
                 Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-
                 Spacer(Modifier.height(8.dp))
-
                 val content = reviewText ?: "Run the reviewer to see results here."
-
                 Box(
-
                     modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
-
                         .padding(8.dp).verticalScroll(rememberScrollState()),
-
                 ) {
-
                     Text(content, style = MaterialTheme.typography.bodySmall)
-
                 }
-
             }
-
         }
-
     }
-
 }
 
 
@@ -897,3 +981,4 @@ private fun sendCurrentMessage(
         setBusy(false)
     }
 }
+
