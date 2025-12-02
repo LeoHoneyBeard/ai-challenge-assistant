@@ -13,6 +13,7 @@ data class UserSettings(
     val lastProject: String? = null,
     val lastChatModel: String = "llama3.1",
     val lastEmbeddingModel: String = "llama3.1",
+    val mcpTools: Map<String, Boolean> = emptyMap(),
 )
 
 object SettingsStore {
@@ -39,14 +40,22 @@ object SettingsStore {
         projectPath: Path? = null,
         chatModel: String? = null,
         embeddingModel: String? = null,
+        mcpTools: Map<String, Boolean>? = null,
     ) {
         val current = load()
         val next = current.copy(
             lastProject = projectPath?.toAbsolutePath()?.toString() ?: current.lastProject,
             lastChatModel = chatModel ?: current.lastChatModel,
             lastEmbeddingModel = embeddingModel ?: current.lastEmbeddingModel,
+            mcpTools = mcpTools ?: current.mcpTools,
         )
         save(next)
+    }
+
+    fun updateMcpTool(toolId: String, enabled: Boolean) {
+        val current = load()
+        val nextMap = current.mcpTools.toMutableMap().also { it[toolId] = enabled }
+        update(mcpTools = nextMap)
     }
 
     private fun save(settings: UserSettings) {

@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -24,6 +25,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -33,6 +36,9 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
+import androidx.compose.material3.Switch
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -51,8 +57,10 @@ import androidx.compose.ui.window.application
 import java.io.FileDescriptor
 import java.io.FileOutputStream
 import java.io.PrintStream
+import com.aichallenge.assistant.mcp.McpServerState
 import com.aichallenge.assistant.model.ChatMessage
 import com.aichallenge.assistant.model.MessageRole
+import com.aichallenge.assistant.model.PullRequestSummary
 import com.aichallenge.assistant.model.RagStatus
 import com.aichallenge.assistant.service.AssistantController
 import com.aichallenge.assistant.service.SettingsStore
@@ -108,6 +116,92 @@ private fun AssistantScreen() {
     var status by remember { mutableStateOf("Choose a README or project folder and press \"Select & ingest\".") }
     var warnings by remember { mutableStateOf<List<String>>(emptyList()) }
     var isBusy by remember { mutableStateOf(false) }
+    val mcpServers = remember { mutableStateListOf<McpServerState>() }
+    var selectedMcpServerId by remember { mutableStateOf<String?>(null) }
+    var selectedTab by remember { mutableStateOf(AssistantTab.CHAT) }
+    val pullRequests = remember { mutableStateListOf<PullRequestSummary>() }
+    var prStatus by remember { mutableStateOf("Pull requests are not loaded.") }
+    var isLoadingPrs by remember { mutableStateOf(false) }
+    var isReviewingPr by remember { mutableStateOf(false) }
+    var lastReviewedPr by remember { mutableStateOf<PullRequestSummary?>(null) }
+    var lastReviewText by remember { mutableStateOf<String?>(null) }
+
+    fun updateMcpServers(servers: List<McpServerState>) {
+        mcpServers.clear()
+        mcpServers.addAll(servers)
+        if (servers.isEmpty()) {
+            selectedMcpServerId = null
+        } else if (selectedMcpServerId == null || servers.none { it.id == selectedMcpServerId }) {
+            selectedMcpServerId = servers.first().id
+        }
+    }
+
+    suspend fun loadMcpServers() {
+        val result = runCatching { controller.mcpServers(projectPath) }
+        result.onSuccess { servers ->
+            updateMcpServers(servers)
+        }.onFailure { error ->
+            status = "Failed to load MCP servers: ${error.message}"
+        }
+    }
+
+    fun refreshMcpServers() {
+        scope.launch {
+            loadMcpServers()
+        }
+    }
+
+    suspend fun loadPullRequests() {
+        if (projectPath == null) {
+            pullRequests.clear()
+            prStatus = "Select a project to load pull requests."
+            return
+        }
+        isLoadingPrs = true
+        val result = controller.listPullRequests(projectPath)
+        result.onSuccess { prs ->
+            pullRequests.clear()
+            pullRequests.addAll(prs)
+            prStatus = "Loaded ${prs.size} pull request(s)."
+        }.onFailure { error ->
+            prStatus = "Failed to load PRs: ${error.message}"
+        }
+        isLoadingPrs = false
+    }
+
+    fun refreshPullRequests() {
+        scope.launch {
+            loadPullRequests()
+        }
+    }
+
+    fun runPullRequestReview(pr: PullRequestSummary) {
+        scope.launch {
+            if (projectPath == null) {
+                status = "Select a project to review pull requests."
+                return@launch
+            }
+            isReviewingPr = true
+            status = "Reviewing PR #${pr.number}..."
+            val result = controller.reviewPullRequest(
+                prNumber = pr.number,
+                baseUrl = baseUrl,
+                chatModel = selectedChatModel,
+                embeddingModel = selectedEmbeddingModel,
+                projectRoot = projectPath,
+            )
+            result.onSuccess { review ->
+                lastReviewedPr = pr
+                lastReviewText = review
+                status = "Review ready for PR #${pr.number}"
+            }.onFailure { error ->
+                lastReviewedPr = pr
+                lastReviewText = "Review failed: ${error.message}"
+                status = "Review failed: ${error.message}"
+            }
+            isReviewingPr = false
+        }
+    }
 
     fun choosePath(): Path? {
         val chooser = JFileChooser().apply {
@@ -138,6 +232,22 @@ private fun AssistantScreen() {
             }
             isBusy = false
         }
+    }
+    
+    fun sendMessage() {
+        sendCurrentMessage(
+            scope = scope,
+            userInput = userInput,
+            setUserInput = { userInput = it },
+            messages = messages,
+            controller = controller,
+            chatModel = selectedChatModel,
+            embeddingModel = selectedEmbeddingModel,
+            baseUrl = baseUrl,
+            projectPath = projectPath,
+            setStatus = { status = it },
+            setBusy = { isBusy = it },
+        )
     }
     
     Column(Modifier.fillMaxSize().padding(16.dp)) {
@@ -204,73 +314,67 @@ private fun AssistantScreen() {
             Spacer(Modifier.width(12.dp))
 
             Column(Modifier.weight(1f).fillMaxHeight()) {
-                Text("Chat", style = MaterialTheme.typography.titleMedium)
-                Spacer(Modifier.height(8.dp))
-                Box(
-                    modifier = Modifier.weight(1f).fillMaxWidth()
-                        .background(MaterialTheme.colorScheme.surfaceVariant),
-                ) {
-                    LazyColumn(
-                        state = listState,
-                        modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp),
-                    ) {
-                        items(messages) { message ->
-                            ChatBubble(message)
-                            Spacer(Modifier.height(8.dp))
-                        }
+                TabRow(selectedTabIndex = selectedTab.ordinal) {
+                    AssistantTab.entries.forEach { tab ->
+                        Tab(
+                            selected = selectedTab == tab,
+                            onClick = { selectedTab = tab },
+                            text = { Text(tab.title) },
+                        )
                     }
                 }
-                Spacer(Modifier.height(8.dp))
-                MessageInputField(
-                    value = userInput,
-                    onValueChange = { userInput = it },
-                    onSubmit = {
-                                sendCurrentMessage(
-                                    scope = scope,
-                                    userInput = userInput,
-                                    setUserInput = { userInput = it },
-                                    messages = messages,
-                                    controller = controller,
-                                    chatModel = selectedChatModel,
-                                    embeddingModel = selectedEmbeddingModel,
-                                    baseUrl = baseUrl,
-                                    projectPath = projectPath,
-                                    setStatus = { status = it },
-                                    setBusy = { isBusy = it },
-                                )
-                    },
-                )
-                Spacer(Modifier.height(8.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Button(
-                        onClick = {
-                        sendCurrentMessage(
-                            scope = scope,
-                            userInput = userInput,
-                            setUserInput = { userInput = it },
+                Spacer(Modifier.height(12.dp))
+                when (selectedTab) {
+                    AssistantTab.CHAT -> {
+                        ChatTabContent(
                             messages = messages,
-                            controller = controller,
-                            chatModel = selectedChatModel,
-                            embeddingModel = selectedEmbeddingModel,
-                            baseUrl = baseUrl,
-                            projectPath = projectPath,
-                            setStatus = { status = it },
-                            setBusy = { isBusy = it },
+                            listState = listState,
+                            userInput = userInput,
+                            onUserInputChange = { userInput = it },
+                            onSend = { sendMessage() },
+                            onClear = {
+                                messages.clear()
+                                status = "History cleared"
+                            },
                         )
-                        },
-                    ) {
-                        Text("Send")
                     }
-                    Spacer(Modifier.width(12.dp))
-                    TextButton(onClick = {
-                        messages.clear()
-                        status = "History cleared"
-                    }) {
-                        Text("Clear chat")
+                    AssistantTab.MCP -> {
+                        McpTabContent(
+                            servers = mcpServers,
+                            selectedServerId = selectedMcpServerId,
+                            onSelectServer = { selectedMcpServerId = it },
+                            onToggleTool = { toolId, enabled ->
+                                scope.launch {
+                                    val updated = controller.setMcpToolEnabled(toolId, enabled, projectPath)
+                                    updateMcpServers(updated)
+                                }
+                            },
+                            onReloadServers = { refreshMcpServers() },
+                        )
+                    }
+                    AssistantTab.PRS -> {
+                        PullRequestTabContent(
+                            pullRequests = pullRequests,
+                            status = prStatus,
+                            isLoading = isLoadingPrs,
+                            isReviewing = isReviewingPr,
+                            reviewedPr = lastReviewedPr,
+                            reviewText = lastReviewText,
+                            onRefresh = { refreshPullRequests() },
+                            onReview = { pr -> runPullRequestReview(pr) },
+                        )
                     }
                 }
             }
         }
+    }
+
+    LaunchedEffect(projectPath) {
+        loadMcpServers()
+    }
+
+    LaunchedEffect(projectPath) {
+        loadPullRequests()
     }
 
     LaunchedEffect(initialSettings.lastProject) {
@@ -396,26 +500,25 @@ private fun ModelDropdown(
     options: List<String>,
     onSelect: (String) -> Unit,
 ) {
-    if (options.isEmpty()) {
-        OutlinedTextField(
-            value = value,
-            onValueChange = onSelect,
-            label = { Text(label) },
-            modifier = Modifier.fillMaxWidth(),
-        )
-    } else {
-        var expanded by remember { mutableStateOf(false) }
+    var expanded by remember { mutableStateOf(false) }
+    Column {
+        Text(label, style = MaterialTheme.typography.labelSmall)
+        Spacer(Modifier.height(4.dp))
         Box {
-            OutlinedTextField(
-                value = value,
-                onValueChange = {},
-                readOnly = true,
-                label = { Text(label) },
-                trailingIcon = { Icon(Icons.Filled.ArrowDropDown, contentDescription = null) },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { expanded = true },
-            )
+            Button(
+                onClick = { expanded = true },
+                enabled = options.isNotEmpty(),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(value.ifBlank { if (options.isEmpty()) "No models available" else "Select" })
+                    Icon(Icons.Filled.ArrowDropDown, contentDescription = null)
+                }
+            }
             DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
                 options.forEach { model ->
                     DropdownMenuItem(
@@ -429,6 +532,328 @@ private fun ModelDropdown(
             }
         }
     }
+}
+
+@Composable
+private fun ChatTabContent(
+    messages: List<ChatMessage>,
+    listState: LazyListState,
+    userInput: String,
+    onUserInputChange: (String) -> Unit,
+    onSend: () -> Unit,
+    onClear: () -> Unit,
+) {
+    Column(Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier.weight(1f).fillMaxWidth()
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+        ) {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp),
+            ) {
+                items(messages) { message ->
+                    ChatBubble(message)
+                    Spacer(Modifier.height(8.dp))
+                }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        MessageInputField(
+            value = userInput,
+            onValueChange = onUserInputChange,
+            onSubmit = onSend,
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Button(onClick = onSend) {
+                Text("Send")
+            }
+            Spacer(Modifier.width(12.dp))
+            TextButton(onClick = onClear) {
+                Text("Clear chat")
+            }
+        }
+    }
+}
+
+@Composable
+private fun McpTabContent(
+    servers: List<McpServerState>,
+    selectedServerId: String?,
+    onSelectServer: (String) -> Unit,
+    onToggleTool: (String, Boolean) -> Unit,
+    onReloadServers: () -> Unit,
+) {
+    if (servers.isEmpty()) {
+        Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("No MCP servers detected. Configure GitHub credentials in local.properties and reload.", style = MaterialTheme.typography.bodyMedium)
+            Spacer(Modifier.height(12.dp))
+            Button(onClick = onReloadServers) {
+                Text("Reload")
+            }
+        }
+        return
+    }
+
+    Row(Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier.width(220.dp).fillMaxHeight()
+                .verticalScroll(rememberScrollState()),
+        ) {
+            servers.forEach { server ->
+                val isSelected = server.id == selectedServerId
+                val cardColors = if (isSelected) {
+                    CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+                } else {
+                    CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                }
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)
+                        .clickable { onSelectServer(server.id) },
+                    colors = cardColors,
+                ) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(server.name, style = MaterialTheme.typography.titleSmall)
+                        Spacer(Modifier.height(4.dp))
+                        Text(server.description, style = MaterialTheme.typography.bodySmall)
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            if (server.online) "Online" else "Offline",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (server.online) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.width(16.dp))
+        val currentServer = servers.firstOrNull { it.id == selectedServerId } ?: servers.first()
+        Column(
+            modifier = Modifier.weight(1f).fillMaxHeight()
+                .verticalScroll(rememberScrollState()),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(currentServer.name, style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onReloadServers) {
+                    Text("Reload")
+                }
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(currentServer.description, style = MaterialTheme.typography.bodyMedium)
+            Spacer(Modifier.height(16.dp))
+            if (currentServer.tools.isEmpty()) {
+                Text("Server does not expose any tools.", style = MaterialTheme.typography.bodyMedium)
+            } else {
+                currentServer.tools.forEach { tool ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(tool.label, style = MaterialTheme.typography.titleSmall)
+                                Spacer(Modifier.height(2.dp))
+                                Text(tool.description, style = MaterialTheme.typography.bodySmall)
+                            }
+                            Switch(
+                                checked = tool.enabled,
+                                onCheckedChange = { checked -> onToggleTool(tool.id, checked) },
+                                enabled = currentServer.online,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PullRequestTabContent(
+
+    pullRequests: List<PullRequestSummary>,
+
+    status: String,
+
+    isLoading: Boolean,
+
+    isReviewing: Boolean,
+
+    reviewedPr: PullRequestSummary?,
+
+    reviewText: String?,
+
+    onRefresh: () -> Unit,
+
+    onReview: (PullRequestSummary) -> Unit,
+
+) {
+
+    Column(Modifier.fillMaxSize()) {
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+
+            Text("Open pull requests", style = MaterialTheme.typography.titleMedium)
+
+            Spacer(Modifier.weight(1f))
+
+            Button(onClick = onRefresh, enabled = !isLoading) {
+
+                Text("Refresh")
+
+            }
+
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        Text(status, style = MaterialTheme.typography.bodySmall)
+
+        if (isLoading) {
+
+            Spacer(Modifier.height(12.dp))
+
+            CircularProgressIndicator(modifier = Modifier.size(32.dp))
+
+        }
+
+        Spacer(Modifier.height(12.dp))
+
+        Row(Modifier.fillMaxSize()) {
+
+            Column(Modifier.weight(1f)) {
+
+                if (pullRequests.isEmpty()) {
+
+                    Text("No pull requests to display.", style = MaterialTheme.typography.bodyMedium)
+
+                } else {
+
+                    LazyColumn {
+
+                        items(pullRequests) { pr ->
+
+                            Card(
+
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+
+                            ) {
+
+                                Column(Modifier.padding(12.dp)) {
+
+                                    Text(
+
+                                        "#${pr.number} ${pr.title}",
+
+                                        style = MaterialTheme.typography.titleSmall,
+
+                                    )
+
+                                    Spacer(Modifier.height(4.dp))
+
+                                    Text(
+
+                                        "Author: ${pr.author} | Branches: ${pr.headBranch} > ${pr.baseBranch}",
+
+                                        style = MaterialTheme.typography.bodySmall,
+
+                                    )
+
+                                    Spacer(Modifier.height(4.dp))
+
+                                    Text(
+
+                                        "Files: ${pr.changedFiles} (+${pr.additions}/-${pr.deletions})",
+
+                                        style = MaterialTheme.typography.bodySmall,
+
+                                    )
+
+                                    Spacer(Modifier.height(4.dp))
+
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+
+                                        Text("Updated: ${pr.updatedAt}", style = MaterialTheme.typography.bodySmall)
+
+                                        Spacer(Modifier.weight(1f))
+
+                                        Button(onClick = { onReview(pr) }, enabled = !isReviewing) {
+
+                                            Text(if (isReviewing) "Reviewing..." else "Review")
+
+                                        }
+
+                                    }
+
+                                }
+
+                            }
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+            Spacer(Modifier.width(16.dp))
+
+            Column(
+
+                modifier = Modifier.weight(1f).fillMaxHeight()
+
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+
+                    .padding(12.dp),
+
+            ) {
+
+                val title = reviewedPr?.let { "#${it.number} ${it.title}" } ?: "No review yet"
+
+                Text("Review output", style = MaterialTheme.typography.titleMedium)
+
+                Spacer(Modifier.height(4.dp))
+
+                Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+
+                Spacer(Modifier.height(8.dp))
+
+                val content = reviewText ?: "Run the reviewer to see results here."
+
+                Box(
+
+                    modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
+
+                        .padding(8.dp).verticalScroll(rememberScrollState()),
+
+                ) {
+
+                    Text(content, style = MaterialTheme.typography.bodySmall)
+
+                }
+
+            }
+
+        }
+
+    }
+
+}
+
+
+
+private enum class AssistantTab(val title: String) {
+    CHAT("Chat"),
+    MCP("MCP"),
+    PRS("Pull Requests"),
 }
 
 private fun sendCurrentMessage(
