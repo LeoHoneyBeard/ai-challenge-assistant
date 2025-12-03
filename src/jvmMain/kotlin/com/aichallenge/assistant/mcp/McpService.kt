@@ -4,12 +4,14 @@ import com.aichallenge.assistant.integrations.McpGitClient
 import com.aichallenge.assistant.model.PullRequestFileDiff
 import com.aichallenge.assistant.model.PullRequestReviewBundle
 import com.aichallenge.assistant.model.PullRequestSummary
+import com.aichallenge.assistant.service.UserIssueRepository
 import com.aichallenge.assistant.service.SettingsStore
 import java.nio.file.Path
 
 class McpService(
     private val gitClient: McpGitClient = McpGitClient(),
     private val githubClient: McpGithubClient = McpGithubClient(),
+    private val userIssueRepository: UserIssueRepository = UserIssueRepository(),
 ) {
 
     suspend fun servers(projectRoot: Path?): List<McpServerState> {
@@ -103,6 +105,7 @@ class McpService(
 
     private suspend fun buildServers(projectRoot: Path?): List<McpServerDefinition> {
         val servers = mutableListOf<McpServerDefinition>()
+        buildWorkspaceServer(projectRoot)?.let { servers += it }
         val githubSettings = LocalPropertiesConfig.githubSettings()
         if (githubSettings != null) {
             val resolved = resolveGithubConfig(githubSettings, projectRoot)
@@ -116,6 +119,31 @@ class McpService(
             log("No GitHub MCP token found in local.properties; skipping MCP servers.")
         }
         return servers
+    }
+
+    private fun buildWorkspaceServer(projectRoot: Path?): McpServerDefinition? {
+        val hasProject = projectRoot != null
+        val tools = listOf(
+            McpToolDefinition(
+                id = "workspace-user-issues",
+                serverId = "workspace",
+                label = "User issues",
+                description = "Reads issues/user_issues.json from the selected project.",
+                enabledByDefault = true,
+                runner = { path ->
+                    userIssueRepository.loadIssues(path).map { issues ->
+                        userIssueRepository.formatForMcp(issues)
+                    }
+                },
+            ),
+        )
+        return McpServerDefinition(
+            id = "workspace",
+            name = "Workspace",
+            description = "Local tools for the currently selected project.",
+            online = hasProject,
+            tools = tools,
+        )
     }
 
     private fun buildGithubServer(config: McpGithubConfig): McpServerDefinition {
