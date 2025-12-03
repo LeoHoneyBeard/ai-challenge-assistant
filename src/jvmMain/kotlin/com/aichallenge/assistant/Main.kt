@@ -66,6 +66,7 @@ import com.aichallenge.assistant.model.ChatMessage
 import com.aichallenge.assistant.model.MessageRole
 import com.aichallenge.assistant.model.PullRequestSummary
 import com.aichallenge.assistant.model.RagStatus
+import com.aichallenge.assistant.model.UserIssue
 import com.aichallenge.assistant.service.AssistantController
 import com.aichallenge.assistant.service.SettingsStore
 import kotlinx.coroutines.CoroutineScope
@@ -137,6 +138,12 @@ private fun AssistantScreen() {
     var webhookStatus by remember { mutableStateOf("Webhook listener disabled.") }
     val webhookServerState = remember { mutableStateOf<GithubWebhookServer?>(null) }
     var currentRepoRef by remember { mutableStateOf<GithubRepoRef?>(null) }
+    val userIssues = remember { mutableStateListOf<UserIssue>() }
+    var issuesStatus by remember { mutableStateOf("User issues are not loaded.") }
+    var isLoadingIssues by remember { mutableStateOf(false) }
+    var isResolvingIssue by remember { mutableStateOf(false) }
+    var selectedIssueForSolution by remember { mutableStateOf<UserIssue?>(null) }
+    var issueResolutionText by remember { mutableStateOf<String?>(null) }
 
     fun updateMcpServers(servers: List<McpServerState>) {
         mcpServers.clear()
@@ -184,6 +191,60 @@ private fun AssistantScreen() {
     fun refreshPullRequests() {
         scope.launch {
             loadPullRequests()
+        }
+    }
+
+    suspend fun loadUserIssuesInternal() {
+        if (projectPath == null) {
+            userIssues.clear()
+            issuesStatus = "Select a project to load user issues."
+            selectedIssueForSolution = null
+            issueResolutionText = null
+            return
+        }
+        isLoadingIssues = true
+        val result = controller.loadUserIssues(projectPath)
+        result.onSuccess { issues ->
+            userIssues.clear()
+            userIssues.addAll(issues)
+            issuesStatus = "Loaded ${issues.size} issue(s)."
+        }.onFailure { error ->
+            userIssues.clear()
+            issuesStatus = "Failed to load user issues: ${error.message}"
+        }
+        isLoadingIssues = false
+    }
+
+    fun refreshUserIssues() {
+        scope.launch {
+            loadUserIssuesInternal()
+        }
+    }
+
+    fun suggestIssueSolution(issue: UserIssue) {
+        scope.launch {
+            if (projectPath == null) {
+                issuesStatus = "Select a project to propose a solution."
+                return@launch
+            }
+            selectedIssueForSolution = issue
+            isResolvingIssue = true
+            issueResolutionText = "Готовлю ответ..."
+            val result = controller.proposeIssueSolution(
+                issue = issue,
+                baseUrl = baseUrl,
+                chatModel = selectedChatModel,
+                embeddingModel = selectedEmbeddingModel,
+                projectRoot = projectPath,
+            )
+            result.onSuccess { solution ->
+                issueResolutionText = solution
+                status = "Solution prepared for ${issue.issue.issueId}."
+            }.onFailure { error ->
+                issueResolutionText = "Не удалось получить решение: ${error.message}"
+                status = "Issue solution failed: ${error.message}"
+            }
+            isResolvingIssue = false
         }
     }
 
@@ -406,6 +467,18 @@ private fun AssistantScreen() {
                             onReview = { pr -> runPullRequestReview(pr) },
                         )
                     }
+                    AssistantTab.ISSUES -> {
+                        UserIssuesTabContent(
+                            issues = userIssues,
+                            status = issuesStatus,
+                            isLoading = isLoadingIssues,
+                            isResolving = isResolvingIssue,
+                            selectedIssue = selectedIssueForSolution,
+                            resolutionText = issueResolutionText,
+                            onRefresh = { refreshUserIssues() },
+                            onSuggestSolution = { issue -> suggestIssueSolution(issue) },
+                        )
+                    }
                 }
             }
         }
@@ -417,6 +490,10 @@ private fun AssistantScreen() {
 
     LaunchedEffect(projectPath) {
         loadPullRequests()
+    }
+
+    LaunchedEffect(projectPath) {
+        loadUserIssuesInternal()
     }
 
     LaunchedEffect(autoReviewEnabled, projectPath, baseUrl, selectedChatModel, selectedEmbeddingModel) {
@@ -932,12 +1009,114 @@ private fun PullRequestTabContent(
     }
 }
 
+@Composable
+private fun UserIssuesTabContent(
+    issues: List<UserIssue>,
+    status: String,
+    isLoading: Boolean,
+    isResolving: Boolean,
+    selectedIssue: UserIssue?,
+    resolutionText: String?,
+    onRefresh: () -> Unit,
+    onSuggestSolution: (UserIssue) -> Unit,
+) {
+    val clipboard = LocalClipboardManager.current
+    val canCopyError = status.isNotBlank() && (
+        status.contains("Failed", ignoreCase = true) ||
+            status.contains("ошибка", ignoreCase = true)
+        )
+    Column(Modifier.fillMaxSize()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("User issues", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.weight(1f))
+            Button(onClick = onRefresh, enabled = !isLoading && !isResolving) {
+                Text("Refresh")
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                status,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.weight(1f),
+            )
+            if (canCopyError) {
+                TextButton(onClick = { clipboard.setText(AnnotatedString(status)) }) {
+                    Text("Скопировать ошибку")
+                }
+            }
+        }
+        if (isLoading) {
+            Spacer(Modifier.height(12.dp))
+            CircularProgressIndicator(modifier = Modifier.size(32.dp))
+        }
+        Spacer(Modifier.height(12.dp))
+        Row(Modifier.fillMaxSize()) {
+            Column(Modifier.weight(1f)) {
+                if (issues.isEmpty()) {
+                    Text("No user issues found in issues/user_issues.json.", style = MaterialTheme.typography.bodyMedium)
+                } else {
+                    LazyColumn {
+                        items(issues) { issue ->
+                            Card(
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                            ) {
+                                Column(Modifier.padding(12.dp)) {
+                                    Text(issue.issue.subject, style = MaterialTheme.typography.titleSmall)
+                                    Spacer(Modifier.height(2.dp))
+                                    Text(
+                                        "ID: ${issue.issue.issueId} | #${issue.issue.issueNumber} | Reporter: ${issue.userName}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                    Spacer(Modifier.height(4.dp))
+                                    Text(issue.issue.description, style = MaterialTheme.typography.bodySmall)
+                                    Spacer(Modifier.height(8.dp))
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Spacer(Modifier.weight(1f))
+                                        Button(
+                                            onClick = { onSuggestSolution(issue) },
+                                            enabled = !isResolving,
+                                        ) {
+                                            Text(if (isResolving && selectedIssue == issue) "Готовлю..." else "Предложить решение")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.width(16.dp))
+            Column(
+                modifier = Modifier.weight(1f).fillMaxHeight()
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .padding(12.dp),
+            ) {
+                val title = selectedIssue?.issue?.subject ?: "Выберите обращение"
+                Text("Ответ ассистента", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(4.dp))
+                Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                val text = resolutionText ?: "Нажмите \"Предложить решение\", чтобы увидеть ответ здесь."
+                Box(
+                    modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
+                        .padding(8.dp).verticalScroll(rememberScrollState()),
+                ) {
+                    Text(text, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+    }
+}
+
 
 
 private enum class AssistantTab(val title: String) {
     CHAT("Chat"),
     MCP("MCP"),
     PRS("Pull Requests"),
+    ISSUES("User Issues"),
 }
 
 private fun sendCurrentMessage(

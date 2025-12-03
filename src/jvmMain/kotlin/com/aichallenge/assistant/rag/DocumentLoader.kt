@@ -64,6 +64,24 @@ class DocumentLoader(
             }
         }
 
+        val projectFaqRoot = selection.resolve("project").resolve("faq")
+        if (projectFaqRoot.isDirectory()) {
+            Files.walk(projectFaqRoot).use { stream ->
+                stream.filter { path ->
+                    path.isRegularFile() && shouldInclude(path)
+                }.forEach { files.add(it) }
+            }
+        }
+
+        val topLevelFaq = selection.resolve("faq")
+        if (topLevelFaq.isDirectory()) {
+            Files.walk(topLevelFaq).use { stream ->
+                stream.filter { path ->
+                    path.isRegularFile() && shouldInclude(path)
+                }.forEach { files.add(it) }
+            }
+        }
+
         val srcDir = selection.resolve("src")
         if (srcDir.isDirectory()) {
             Files.walk(srcDir).use { stream ->

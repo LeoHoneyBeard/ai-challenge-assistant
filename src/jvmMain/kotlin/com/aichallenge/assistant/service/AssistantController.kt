@@ -9,6 +9,7 @@ import com.aichallenge.assistant.mcp.McpService
 import com.aichallenge.assistant.model.IngestResult
 import com.aichallenge.assistant.model.PullRequestSummary
 import com.aichallenge.assistant.model.RagStatus
+import com.aichallenge.assistant.model.UserIssue
 import com.aichallenge.assistant.rag.DocumentLoader
 import com.aichallenge.assistant.rag.KnowledgeBase
 import com.aichallenge.assistant.rag.KnowledgeChunk
@@ -23,7 +24,11 @@ class AssistantController(
     private val ollamaClient: OllamaClient = OllamaClient(),
     private val projectStructureAnalyzer: ProjectStructureAnalyzer = ProjectStructureAnalyzer(),
     private val mcpGitClient: McpGitClient = McpGitClient(),
-    private val mcpService: McpService = McpService(gitClient = mcpGitClient),
+    private val userIssueRepository: UserIssueRepository = UserIssueRepository(),
+    private val mcpService: McpService = McpService(
+        gitClient = mcpGitClient,
+        userIssueRepository = userIssueRepository,
+    ),
 ) {
 
     suspend fun ingest(path: Path, baseUrl: String, embeddingModel: String): IngestResult = withContext(Dispatchers.IO) {
@@ -236,6 +241,47 @@ class AssistantController(
         response.onSuccess { log("REVIEW", "Review completed for PR #$prNumber") }
         response.onFailure { log("REVIEW", "Review failed for PR #$prNumber: ${it.message}") }
         return response
+    }
+
+    suspend fun loadUserIssues(projectRoot: Path?): Result<List<UserIssue>> =
+        userIssueRepository.loadIssues(projectRoot)
+
+    suspend fun proposeIssueSolution(
+        issue: UserIssue,
+        baseUrl: String,
+        chatModel: String,
+        embeddingModel: String,
+        projectRoot: Path?,
+    ): Result<String> {
+        val query = buildString {
+            appendLine(issue.issue.subject)
+            appendLine(issue.issue.description)
+        }.trim()
+        val ragContext = ragContextFromQuery(baseUrl, embeddingModel, query)
+            .getOrElse { error ->
+                "RAG context unavailable: ${error.message}"
+            }
+        val systemPrompt = buildString {
+            appendLine("Ты — инженер поддержки AI Challenge Assistant.")
+            appendLine("Объясняй поведение и предлагай шаги решения так, будто отвечаешь пользователю — без глубоких технических деталей реализации.")
+            appendLine("Опирайся на FAQ, README, docs и исходники, но пересказывай выводы простыми словами. Всегда отвечай по-русски.")
+            appendLine("Контекст из поискового запроса по базе знаний:")
+            appendLine(ragContext)
+        }
+        val userPrompt = buildString {
+            appendLine("Пользователь ${issue.userName} отправил обращение.")
+            appendLine("ID: ${issue.issue.issueId}, номер: ${issue.issue.issueNumber}")
+            appendLine("Тема: ${issue.issue.subject}")
+            appendLine("Описание: ${issue.issue.description}")
+            appendLine()
+            appendLine("Предложи решение или объясни текущее поведение продукта простыми словами. Если нужно, предложи шаги диагностики или workaround.")
+            appendLine("Не углубляйся в детали реализации кода; сосредоточься на действиях пользователя и ожидаемом эффекте.")
+        }
+        val messages = listOf(
+            OllamaMessage(role = "system", content = systemPrompt),
+            OllamaMessage(role = "user", content = userPrompt),
+        )
+        return ollamaClient.chat(baseUrl = baseUrl, model = chatModel, messages = messages)
     }
 
     suspend fun detectRepository(projectRoot: Path?): Result<GithubRepoRef> {

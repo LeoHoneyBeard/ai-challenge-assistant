@@ -1,4 +1,4 @@
-# AI Challenge Assistant
+﻿# AI Challenge Assistant
 
 
 
@@ -6,21 +6,23 @@ AI Challenge Assistant is a Kotlin/Compose desktop helper that indexes the proje
 
 
 
+
 ## Features
 
-- **RAG ingestion** – loads README, everything under `project/docs`, and code under `src/**` (with size caps) so the assistant can embed both documentation and implementation details.
+- **RAG ingestion** вЂ“ loads README, everything under `project/docs`, the optional `project/faq` knowledge base, and code under `src/**` (with size caps) so the assistant can embed both documentation and implementation details.
 
-- **Ollama client** – configurable base URL/model; uses Ktor to call `POST /api/chat`.
+- **Ollama client** вЂ“ configurable base URL/model; uses Ktor to call `POST /api/chat`.
 
-- **MCP/Git bridge** – lightweight `McpGitClient` runs `git rev-parse --abbrev-ref HEAD` inside the selected folder and feeds the branch into the system prompt.
+- **MCP/Git bridge** вЂ“ lightweight `McpGitClient` runs `git rev-parse --abbrev-ref HEAD` inside the selected folder and feeds the branch into the system prompt.
 
-- **MCP control center** – a dedicated UI tab lists the GitHub MCP tools (overview, issues, PRs, commits, branches, contributors) and lets the user enable or disable each one before the model can request it.
+- **MCP control center** вЂ“ a dedicated UI tab lists the GitHub MCP tools (overview, issues, PRs, commits, branches, contributors) and lets the user enable or disable each one before the model can request it.
 
-- **Pull request reviewer** – a dedicated tab fetches open GitHub PRs via MCP, displays accurate change stats, and renders the latest Russian-language review next to the list for quick scanning.
+- **Pull request reviewer** вЂ“ a dedicated tab fetches open GitHub PRs via MCP, displays accurate change stats, and renders the latest Russian-language review next to the list for quick scanning.
+- **User issues triage** вЂ“ the new User Issues tab reads `issues/user_issues.json`, refreshes the list on demand, and lets you ask the LLM for a Russian-language solution backed by README/docs/src/FAQ snippets.
 
-- **`/help` command** – summarizes folders, key files and active RAG sources without calling the model.
+- **`/help` command** вЂ“ summarizes folders, key files and active RAG sources without calling the model.
 
-- **Desktop chat UI** – Compose Material3 layout with project selector, branch refresh button, warnings, chat history and clear action.
+- **Desktop chat UI** вЂ“ Compose Material3 layout with project selector, branch refresh button, warnings, chat history and clear action.
 
 
 
@@ -114,6 +116,10 @@ After saving the file, restart the app or click **Reload** inside the MCP tab. E
 
 
 
+Workspace tools:
+
+- `workspace-user-issues`
+
 Currently available GitHub tools:
 
 - `github-repo-overview`
@@ -155,6 +161,13 @@ GITHUB_WEBHOOK_SECRET
 
 The diff provided to the model is truncated to ~120k characters; if a PR is larger, the assistant still lists the affected files and highlights that portions of the diff were omitted.
 
+## User issues
+
+- Populate `issues/user_issues.json` with an array of user requests. Each entry must have a `userName` plus an `issue` object with `issueId`, `issueNumber`, `subject`, and `issue` (detailed description).
+- Open the **User Issues** tab to review the queue, refresh it from disk, and click **Предложить решение** to ask the assistant for diagnostics or a workaround.
+- The model automatically builds a query from the issue, searches README, docs, source code, and the `project/faq` folder, and returns a Russian-language response summarizing how to fix or explain the behavior.
+- The `workspace-user-issues` MCP tool exposes the same JSON data to the model so it can request freshness when composing answers in the chat tab.
+
 ## Headless CLI runner
 You can still run the reviewer in CI or from scripts even though the default GitHub workflows were removed:
 `
@@ -172,7 +185,7 @@ To trigger reviews directly on the running desktop app:
 
 Webhook delivery only triggers the review; all GitHub API access still relies on `MCP_GITHUB_TOKEN` (or your PAT) for fetching diffs and files.
 Creating a GitHub App (quick steps):
-1. Go to **Settings → Developer settings → GitHub Apps** (or the org equivalent) and click **New GitHub App**.
+1. Go to **Settings в†’ Developer settings в†’ GitHub Apps** (or the org equivalent) and click **New GitHub App**.
 2. Fill in name/homepage, paste your public webhook URL, and set a webhook secret (`openssl rand -hex 32` or `python -c "import secrets;print(secrets.token_hex(32))"`).
 3. Grant repository permissions: `Pull requests: Read-only`, `Contents: Read-only` (optional).
 4. Subscribe to the `pull_request` event.
@@ -182,15 +195,17 @@ Creating a GitHub App (quick steps):
 
 ## Repository layout
 
-- `src/jvmMain/kotlin/com/aichallenge/assistant/Main.kt` – UI + app entry point.
+- `src/jvmMain/kotlin/com/aichallenge/assistant/Main.kt` вЂ“ UI + app entry point.
 
-- `src/jvmMain/kotlin/com/aichallenge/assistant/service` – controller and project analyzer.
+- `src/jvmMain/kotlin/com/aichallenge/assistant/service` вЂ“ controller and project analyzer.
 
-- `src/jvmMain/kotlin/com/aichallenge/assistant/rag` – document ingestion and retrieval.
+- `src/jvmMain/kotlin/com/aichallenge/assistant/rag` вЂ“ document ingestion and retrieval.
 
-- `src/jvmMain/kotlin/com/aichallenge/assistant/integrations` – Ollama and MCP/Git clients.
+- `src/jvmMain/kotlin/com/aichallenge/assistant/integrations` вЂ“ Ollama and MCP/Git clients.
 
-- `project/docs` – base knowledge for the RAG index.
+- `project/docs` вЂ“ base knowledge for the RAG index.
+- `project/faq` – frequently asked questions auto-indexed into RAG.
+- `issues/user_issues.json` – editable queue of user requests for the User Issues tab.
 
 
 
@@ -207,5 +222,14 @@ The included MCP bridge executes the Git CLI to obtain the current branch. To sw
 - Support additional MCP providers (open files, tickets) and surface them in the chat.
 
 - Extend `/help` with coding guidelines or style rules sourced from docs.
+
+
+
+
+
+
+
+
+
 
 
