@@ -4,6 +4,7 @@ import com.aichallenge.assistant.integrations.McpGitClient
 import com.aichallenge.assistant.model.PullRequestFileDiff
 import com.aichallenge.assistant.model.PullRequestReviewBundle
 import com.aichallenge.assistant.model.PullRequestSummary
+import com.aichallenge.assistant.service.TaskTrackerRepository
 import com.aichallenge.assistant.service.UserIssueRepository
 import com.aichallenge.assistant.service.SettingsStore
 import java.nio.file.Path
@@ -12,6 +13,7 @@ class McpService(
     private val gitClient: McpGitClient = McpGitClient(),
     private val githubClient: McpGithubClient = McpGithubClient(),
     private val userIssueRepository: UserIssueRepository = UserIssueRepository(),
+    private val taskTrackerRepository: TaskTrackerRepository = TaskTrackerRepository(),
 ) {
 
     suspend fun servers(projectRoot: Path?): List<McpServerState> {
@@ -88,7 +90,7 @@ class McpService(
             )
         }
 
-    suspend fun runTool(toolId: String, projectRoot: Path?): Result<String> {
+    suspend fun runTool(toolId: String, payload: String?, projectRoot: Path?): Result<String> {
         log("Executing tool request id=$toolId project=${projectRoot?.toString() ?: "none"}")
         val definitions = buildServers(projectRoot)
         val definition = definitions.flatMap { it.tools }.firstOrNull { it.id.equals(toolId, ignoreCase = true) }
@@ -97,7 +99,7 @@ class McpService(
         if (!enabled) {
             return Result.failure(IllegalStateException("Tool $toolId is disabled by the user"))
         }
-        val result = definition.runner(projectRoot)
+        val result = definition.runner(projectRoot, payload)
         result.onSuccess { log("Tool $toolId succeeded (${snippet(it)}).") }
         result.onFailure { log("Tool $toolId failed: ${it.message}") }
         return result
@@ -130,9 +132,73 @@ class McpService(
                 label = "User issues",
                 description = "Reads issues/user_issues.json from the selected project.",
                 enabledByDefault = true,
-                runner = { path ->
+                runner = { path, _ ->
                     userIssueRepository.loadIssues(path).map { issues ->
                         userIssueRepository.formatForMcp(issues)
+                    }
+                },
+            ),
+            McpToolDefinition(
+                id = "workspace-task-tracker",
+                serverId = "workspace",
+                label = "Task tracker",
+                description = "Reads task_tracker/tasks.json and lists tasks with priorities and requirements.",
+                enabledByDefault = true,
+                runner = { path, _ ->
+                    taskTrackerRepository.loadTasks(path).fold(
+                        onSuccess = { tasks ->
+                            Result.success(taskTrackerRepository.formatForMcp(tasks))
+                        },
+                        onFailure = { error ->
+                            val message = error.message.orEmpty()
+                            if (message.contains("Task tracker file not found", ignoreCase = true)) {
+                                Result.success("Task tracker file not found. Use the task creation tool to initialize task_tracker/tasks.json.")
+                            } else {
+                                Result.failure(error)
+                            }
+                        },
+                    )
+                },
+            ),
+            McpToolDefinition(
+                id = "workspace-create-task",
+                serverId = "workspace",
+                label = "Create project task",
+                description = "Creates or appends to task_tracker/tasks.json. Provide a JSON payload with title, description, priority (LOW/MEDIUM/HIGH/CRITICAL), and requirements array.",
+                enabledByDefault = true,
+                runner = { path, payload ->
+                    val draft = taskTrackerRepository.parseDraftPayload(payload)
+                        .getOrElse { error -> return@McpToolDefinition Result.failure(error) }
+                    taskTrackerRepository.createTask(path, draft).map { task ->
+                        buildString {
+                            appendLine("Created task ${task.title} (ID=${task.id}, priority=${task.priority}).")
+                            if (task.description.isNotBlank()) {
+                                appendLine("Description: ${task.description}")
+                            }
+                            if (task.requirements.isNotEmpty()) {
+                                appendLine("Requirements:")
+                                task.requirements.forEach { appendLine("- $it") }
+                            }
+                        }.trim()
+                    }
+                },
+            ),
+            McpToolDefinition(
+                id = "workspace-create-tasks-batch",
+                serverId = "workspace",
+                label = "Create multiple project tasks",
+                description = "Creates several tasks at once. Provide a JSON array (or {\"tasks\":[...]}) of task objects with title, description, priority, and requirements.",
+                enabledByDefault = true,
+                runner = { path, payload ->
+                    val drafts = taskTrackerRepository.parseDraftListPayload(payload)
+                        .getOrElse { error -> return@McpToolDefinition Result.failure(error) }
+                    taskTrackerRepository.createTasks(path, drafts).map { tasks ->
+                        buildString {
+                            appendLine("Created ${tasks.size} task(s):")
+                            tasks.forEach { task ->
+                                appendLine("- ${task.title} (ID=${task.id}, priority=${task.priority})")
+                            }
+                        }.trim()
                     }
                 },
             ),
@@ -155,7 +221,7 @@ class McpService(
                 label = "Repository overview",
                 description = "Summarizes description, language, branch, and counters for $repoLabel.",
                 enabledByDefault = true,
-                runner = {
+                runner = { _, _ ->
                     githubClient.fetchRepository(config).map { repo ->
                         buildString {
                             appendLine("Repository: $repoLabel")
@@ -175,7 +241,7 @@ class McpService(
                 label = "Open issues",
                 description = "Lists the latest open GitHub issues for $repoLabel.",
                 enabledByDefault = false,
-                runner = {
+                runner = { _, _ ->
                     githubClient.fetchOpenIssues(config).map { issues ->
                         if (issues.isEmpty()) {
                             "No open issues found for $repoLabel."
@@ -197,7 +263,7 @@ class McpService(
                 label = "Open pull requests",
                 description = "Lists the latest open pull requests for $repoLabel.",
                 enabledByDefault = false,
-                runner = {
+                runner = { _, _ ->
                     githubClient.fetchOpenPullRequests(config).map { pulls ->
                         if (pulls.isEmpty()) {
                             "No open pull requests found for $repoLabel."
@@ -219,7 +285,7 @@ class McpService(
                 label = "Recent commits",
                 description = "Shows the latest commits merged into $repoLabel.",
                 enabledByDefault = false,
-                runner = {
+                runner = { _, _ ->
                     githubClient.fetchLatestCommits(config).map { commits ->
                         if (commits.isEmpty()) {
                             "GitHub returned no recent commits for $repoLabel."
@@ -243,7 +309,7 @@ class McpService(
                 label = "Latest branches",
                 description = "Lists the most recently updated branches for $repoLabel.",
                 enabledByDefault = false,
-                runner = {
+                runner = { _, _ ->
                     githubClient.fetchBranches(config).map { branches ->
                         if (branches.isEmpty()) {
                             "No branches returned for $repoLabel."
@@ -265,7 +331,7 @@ class McpService(
                 label = "Top contributors",
                 description = "Lists the most active contributors for $repoLabel.",
                 enabledByDefault = false,
-                runner = {
+                runner = { _, _ ->
                     githubClient.fetchContributors(config).map { contributors ->
                         if (contributors.isEmpty()) {
                             "GitHub returned no contributors for $repoLabel."
@@ -384,5 +450,5 @@ private data class McpToolDefinition(
     val label: String,
     val description: String,
     val enabledByDefault: Boolean,
-    val runner: suspend (Path?) -> Result<String>,
+    val runner: suspend (Path?, String?) -> Result<String>,
 )
