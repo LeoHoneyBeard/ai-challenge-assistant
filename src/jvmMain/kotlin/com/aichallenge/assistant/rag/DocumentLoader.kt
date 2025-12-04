@@ -26,7 +26,7 @@ class DocumentLoader(
     fun loadSources(selectedPath: Path): RagLoadResult {
         val normalized = selectedPath.toAbsolutePath().normalize()
         val root = if (normalized.isDirectory()) normalized else normalized.parent
-        val targets = collectTargets(normalized)
+        val targets = collectTargets(normalized, root)
 
         val chunks = mutableListOf<TextChunk>()
         val errors = mutableListOf<String>()
@@ -47,15 +47,24 @@ class DocumentLoader(
         )
     }
 
-    private fun collectTargets(selection: Path): List<Path> {
-        if (selection.isRegularFile()) return listOf(selection)
-        if (!selection.isDirectory()) return emptyList()
-
+    private fun collectTargets(selection: Path, projectRoot: Path?): List<Path> {
         val files = linkedSetOf<Path>()
-        val readme = selection.resolve("README.md")
+        val base = when {
+            selection.isDirectory() -> selection
+            projectRoot != null -> projectRoot
+            else -> selection.parent
+        }
+        if (selection.isRegularFile()) {
+            files.add(selection)
+        }
+        if (base == null || !base.isDirectory()) {
+            return files.toList()
+        }
+
+        val readme = base.resolve("README.md")
         if (readme.isRegularFile()) files.add(readme)
 
-        val docsRoot = selection.resolve("project").resolve("docs")
+        val docsRoot = base.resolve("project").resolve("docs")
         if (docsRoot.isDirectory()) {
             Files.walk(docsRoot).use { stream ->
                 stream.filter { path ->
@@ -64,7 +73,7 @@ class DocumentLoader(
             }
         }
 
-        val projectFaqRoot = selection.resolve("project").resolve("faq")
+        val projectFaqRoot = base.resolve("project").resolve("faq")
         if (projectFaqRoot.isDirectory()) {
             Files.walk(projectFaqRoot).use { stream ->
                 stream.filter { path ->
@@ -73,7 +82,7 @@ class DocumentLoader(
             }
         }
 
-        val topLevelFaq = selection.resolve("faq")
+        val topLevelFaq = base.resolve("faq")
         if (topLevelFaq.isDirectory()) {
             Files.walk(topLevelFaq).use { stream ->
                 stream.filter { path ->
@@ -82,7 +91,7 @@ class DocumentLoader(
             }
         }
 
-        val srcDir = selection.resolve("src")
+        val srcDir = base.resolve("src")
         if (srcDir.isDirectory()) {
             Files.walk(srcDir).use { stream ->
                 stream.filter { path ->
@@ -91,14 +100,14 @@ class DocumentLoader(
             }
         }
 
-        Files.walk(selection, 2).use { stream ->
+        Files.walk(base, 2).use { stream ->
             stream.filter { path ->
                 path.isRegularFile() && path.extension.equals("md", ignoreCase = true)
             }.forEach { files.add(it) }
         }
 
         if (files.isEmpty()) {
-            Files.walk(selection, 2).use { stream ->
+            Files.walk(base, 2).use { stream ->
                 stream.filter { it.isRegularFile() && shouldInclude(it) }
                     .forEach { files.add(it) }
             }

@@ -7,8 +7,12 @@ import com.aichallenge.assistant.integrations.OllamaMessage
 import com.aichallenge.assistant.mcp.McpServerState
 import com.aichallenge.assistant.mcp.McpService
 import com.aichallenge.assistant.model.IngestResult
+import com.aichallenge.assistant.model.ChatMessage
+import com.aichallenge.assistant.model.MessageRole
+import com.aichallenge.assistant.model.ProjectTask
 import com.aichallenge.assistant.model.PullRequestSummary
 import com.aichallenge.assistant.model.RagStatus
+import com.aichallenge.assistant.model.TaskDraft
 import com.aichallenge.assistant.model.UserIssue
 import com.aichallenge.assistant.rag.DocumentLoader
 import com.aichallenge.assistant.rag.KnowledgeBase
@@ -25,9 +29,11 @@ class AssistantController(
     private val projectStructureAnalyzer: ProjectStructureAnalyzer = ProjectStructureAnalyzer(),
     private val mcpGitClient: McpGitClient = McpGitClient(),
     private val userIssueRepository: UserIssueRepository = UserIssueRepository(),
+    private val taskTrackerRepository: TaskTrackerRepository = TaskTrackerRepository(),
     private val mcpService: McpService = McpService(
         gitClient = mcpGitClient,
         userIssueRepository = userIssueRepository,
+        taskTrackerRepository = taskTrackerRepository,
     ),
 ) {
 
@@ -71,6 +77,8 @@ class AssistantController(
         baseUrl: String,
         gitBranch: String?,
         projectRoot: Path?,
+        requireTaskCreation: Boolean = false,
+        history: List<ChatMessage> = emptyList(),
         extraSystemPrompt: String? = null,
     ): Result<String> {
         val isHelp = question.startsWith("/help", ignoreCase = true)
@@ -117,14 +125,22 @@ class AssistantController(
             if (availableTools.isEmpty()) {
                 appendLine("No MCP tools are currently approved by the user.")
             } else {
-                appendLine("Available MCP tools (request by responding with `MCP_REQUEST:tool_name` only):")
+                appendLine("Available MCP tools (request them by responding with `MCP_REQUEST:tool_name` and, if arguments are necessary, add a newline followed by a JSON payload).")
+                appendLine("Tool usage principles:")
+                appendLine("1) Always gather required data via tools when it exists locally instead of asking the user to paste it (e.g., fetch user issues with `workspace-user-issues`).")
+                appendLine("2) You may request multiple tools sequentially to complete a workflow (for example, read user issues and then create project tasks).")
+                appendLine("3) When calling task-creation tools (`workspace-create-task` or `workspace-create-tasks-batch`), provide a full JSON payload such as {\"title\":\"...\",\"description\":\"...\",\"priority\":\"HIGH\",\"requirements\":[\"...\"]}. Use the batch tool when the user asks for multiple tasks in one message.")
+                appendLine("4) If the user explicitly asks to add or update tasks, you MUST call one of the task-creation tools; do not respond with JSON only. Show the JSON, then immediately issue the MCP request so the task is persisted.")
+                appendLine("5) Never claim a task exists unless the tool succeeded. If the tool fails, explain the failure and ask the user to correct the payload.")
+                appendLine("After each tool result, continue reasoning; only send the final answer once you have satisfied the request without referencing MCP or intermediate steps.")
                 availableTools.forEach { tool ->
                     appendLine("- ${tool.id} (${tool.serverName}): ${tool.description}")
                 }
-                appendLine("Only request a tool if it is necessary, and after receiving the result you must incorporate it into your answer without mentioning MCP, tool names, or intermediate steps to the user.")
+                appendLine("Only request a tool when it helps fulfill the instruction; once the tool returns data, incorporate it naturally into your answer.")
             }
         }
 
+        val historyMessages = historyToOllama(history)
         val userMessage = if (isHelp) {
             val payload = question.removePrefix("/help").trim()
             val messageContent = buildString {
@@ -141,32 +157,49 @@ class AssistantController(
             OllamaMessage(role = "user", content = question)
         }
 
-        val conversation = mutableListOf(
-            OllamaMessage(role = "system", content = systemPrompt),
-            userMessage,
-        )
+        val conversation = mutableListOf(OllamaMessage(role = "system", content = systemPrompt))
+        conversation.addAll(historyMessages)
+        conversation += userMessage
 
-        repeat(3) { attempt ->
-            log("OLLAMA", "Chat request attempt=${attempt + 1} model=$chatModel messages=${conversation.size}")
+        var attempt = 0
+        var pendingTaskCreation = requireTaskCreation
+        while (attempt < MAX_TOOL_REQUEST_ATTEMPTS) {
+            attempt++
+            log("OLLAMA", "Chat request attempt=$attempt model=$chatModel messages=${conversation.size}")
             val response = ollamaClient.chat(baseUrl = baseUrl, model = chatModel, messages = conversation)
             response.onFailure {
-                log("OLLAMA", "Chat failed on attempt=${attempt + 1}: ${it.message}")
+                log("OLLAMA", "Chat failed on attempt=$attempt: ${it.message}")
                 return response
             }
             val content = response.getOrThrow()
-            log("OLLAMA", "Chat response attempt=${attempt + 1}: ${snippet(content)}")
+            log("OLLAMA", "Chat response attempt=$attempt: ${snippet(content)}")
             val requestedTool = parseToolRequest(content)
             if (requestedTool == null) {
+                if (pendingTaskCreation) {
+                    conversation += OllamaMessage(
+                        role = "system",
+                        content = "The user explicitly asked to create tasks. Call `workspace-create-task` with the JSON payload you prepared, wait for the tool result, and only then respond to the user.",
+                    )
+                    continue
+                }
                 return Result.success(content)
             } else {
-                log("MCP", "Model requested tool '$requestedTool' on attempt=${attempt + 1}")
+                log("MCP", "Model requested tool '${requestedTool.id}' on attempt=$attempt")
                 conversation += OllamaMessage(role = "assistant", content = content)
-                val toolResult = runTool(requestedTool, projectRoot).getOrElse { it.message ?: "tool error" }
-                log("MCP", "Tool '$requestedTool' result: ${snippet(toolResult)}")
+                val toolOutcome = runTool(requestedTool.id, requestedTool.payload, projectRoot)
+                val toolResult = toolOutcome.getOrElse { it.message ?: "tool error" }
+                log("MCP", "Tool '${requestedTool.id}' result: ${snippet(toolResult)}")
                 conversation += OllamaMessage(
                     role = "system",
-                    content = "Tool '$requestedTool' returned:\n$toolResult\nUse this information to answer the user naturally without referencing tool invocations.",
+                    content = buildString {
+                        appendLine("Tool '${requestedTool.id}' returned:")
+                        appendLine(toolResult)
+                        appendLine("Use this information to answer the user naturally without referencing tool invocations.")
+                    },
                 )
+                if (toolOutcome.isSuccess && TASK_CREATION_TOOL_IDS.any { requestedTool.id.equals(it, ignoreCase = true) }) {
+                    pendingTaskCreation = false
+                }
             }
         }
         return Result.failure(IllegalStateException("Exceeded MCP tool request limit."))
@@ -246,6 +279,18 @@ class AssistantController(
     suspend fun loadUserIssues(projectRoot: Path?): Result<List<UserIssue>> =
         userIssueRepository.loadIssues(projectRoot)
 
+    suspend fun loadTasks(projectRoot: Path?): Result<List<ProjectTask>> =
+        taskTrackerRepository.loadTasks(projectRoot)
+
+    suspend fun createTask(projectRoot: Path?, draft: TaskDraft): Result<ProjectTask> =
+        taskTrackerRepository.createTask(projectRoot, draft)
+
+    suspend fun createTasks(projectRoot: Path?, drafts: List<TaskDraft>): Result<List<ProjectTask>> =
+        taskTrackerRepository.createTasks(projectRoot, drafts)
+
+    suspend fun deleteTask(projectRoot: Path?, taskId: String): Result<ProjectTask> =
+        taskTrackerRepository.deleteTask(projectRoot, taskId)
+
     suspend fun proposeIssueSolution(
         issue: UserIssue,
         baseUrl: String,
@@ -320,17 +365,60 @@ class AssistantController(
         return score
     }
 
-    private fun parseToolRequest(response: String): String? {
+    private fun parseToolRequest(response: String): ToolRequest? {
         val marker = "MCP_REQUEST:"
-        return response.trim().takeIf { it.startsWith(marker) }?.substring(marker.length)?.trim()
+        val index = response.lastIndexOf(marker)
+        if (index < 0) return null
+        val remainderRaw = response.substring(index + marker.length)
+        val remainder = remainderRaw.trimStart()
+        if (remainder.isEmpty()) return null
+        val newlineIndex = remainder.indexOf('\n')
+        val firstLine = if (newlineIndex >= 0) remainder.substring(0, newlineIndex) else remainder
+        if (firstLine.isBlank()) return null
+        val inlineParts = firstLine.split(" ", limit = 2)
+        val toolId = inlineParts.first().trim()
+        if (toolId.isEmpty()) return null
+        val inlinePayload = inlineParts.getOrNull(1)?.takeIf { it.isNotBlank() }
+        val blockPayload = if (newlineIndex >= 0) {
+            remainder.substring(newlineIndex + 1).trim().takeIf { it.isNotBlank() }
+        } else {
+            null
+        }
+        val priorContext = response.substring(0, index)
+        val fencedPayload = extractLastCodeBlock(priorContext)
+        val payload = inlinePayload ?: blockPayload ?: fencedPayload
+        return ToolRequest(toolId, payload)
     }
 
-    private suspend fun runTool(toolName: String, projectRoot: Path?): Result<String> {
-        log("MCP", "Executing tool '$toolName'")
-        val result = mcpService.runTool(toolName, projectRoot)
+    private data class ToolRequest(
+        val id: String,
+        val payload: String?,
+    )
+
+    private suspend fun runTool(toolName: String, payload: String?, projectRoot: Path?): Result<String> {
+        log("MCP", "Executing tool '$toolName' with payload=${payload != null}")
+        val result = mcpService.runTool(toolName, payload, projectRoot)
         result.onSuccess { log("MCP", "Tool '$toolName' succeeded: ${snippet(it)}") }
         result.onFailure { log("MCP", "Tool '$toolName' failed: ${it.message}") }
         return result
+    }
+
+    private fun historyToOllama(history: List<ChatMessage>): List<OllamaMessage> =
+        history.takeLast(MAX_HISTORY_MESSAGES).mapNotNull { message ->
+            val content = message.text.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            when (message.role) {
+                MessageRole.USER -> OllamaMessage(role = "user", content = content)
+                MessageRole.ASSISTANT -> OllamaMessage(role = "assistant", content = content)
+                MessageRole.SYSTEM -> OllamaMessage(role = "system", content = content)
+            }
+        }
+
+    private fun extractLastCodeBlock(text: String): String? {
+        val matches = fencedCodeBlockRegex.findAll(text).toList()
+        if (matches.isEmpty()) return null
+        val jsonBlock = matches.lastOrNull { it.groups[1]?.value.equals("json", ignoreCase = true) }
+        val target = jsonBlock ?: matches.last()
+        return target.groups[2]?.value?.trim()?.takeIf { it.isNotEmpty() }
     }
 
     private suspend fun embedChunk(baseUrl: String, model: String, chunk: TextChunk): Result<List<Double>> {
@@ -358,6 +446,11 @@ class AssistantController(
         return Result.success(context)
     }
 }
+
+private const val MAX_TOOL_REQUEST_ATTEMPTS = 6
+private const val MAX_HISTORY_MESSAGES = 10
+private val TASK_CREATION_TOOL_IDS = setOf("workspace-create-task", "workspace-create-tasks-batch")
+private val fencedCodeBlockRegex = Regex("```(?:([a-zA-Z0-9_-]+))?\\s*([\\s\\S]*?)```", setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE, RegexOption.DOT_MATCHES_ALL))
 
 private fun log(tag: String, message: String) {
     println("[Assistant][$tag] $message")

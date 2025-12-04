@@ -1,5 +1,6 @@
 package com.aichallenge.assistant
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -24,13 +25,16 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Divider
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -52,6 +56,7 @@ import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
@@ -64,8 +69,10 @@ import com.aichallenge.assistant.mcp.LocalPropertiesConfig
 import com.aichallenge.assistant.mcp.McpServerState
 import com.aichallenge.assistant.model.ChatMessage
 import com.aichallenge.assistant.model.MessageRole
+import com.aichallenge.assistant.model.ProjectTask
 import com.aichallenge.assistant.model.PullRequestSummary
 import com.aichallenge.assistant.model.RagStatus
+import com.aichallenge.assistant.model.TaskPriority
 import com.aichallenge.assistant.model.UserIssue
 import com.aichallenge.assistant.service.AssistantController
 import com.aichallenge.assistant.service.SettingsStore
@@ -144,6 +151,10 @@ private fun AssistantScreen() {
     var isResolvingIssue by remember { mutableStateOf(false) }
     var selectedIssueForSolution by remember { mutableStateOf<UserIssue?>(null) }
     var issueResolutionText by remember { mutableStateOf<String?>(null) }
+    val projectTasks = remember { mutableStateListOf<ProjectTask>() }
+    var tasksStatus by remember { mutableStateOf("Task tracker is not loaded.") }
+    var isLoadingTasks by remember { mutableStateOf(false) }
+    val deletingTaskIds = remember { mutableStateListOf<String>() }
 
     fun updateMcpServers(servers: List<McpServerState>) {
         mcpServers.clear()
@@ -218,6 +229,55 @@ private fun AssistantScreen() {
     fun refreshUserIssues() {
         scope.launch {
             loadUserIssuesInternal()
+        }
+    }
+
+    suspend fun loadTaskTrackerInternal() {
+        if (projectPath == null) {
+            projectTasks.clear()
+            tasksStatus = "Select a project to load tasks."
+            return
+        }
+        isLoadingTasks = true
+        val result = controller.loadTasks(projectPath)
+        result.onSuccess { tasks ->
+            projectTasks.clear()
+            projectTasks.addAll(tasks)
+            tasksStatus = "Loaded ${tasks.size} task(s)."
+        }.onFailure { error ->
+            projectTasks.clear()
+            tasksStatus = if (error.message?.contains("Task tracker file not found", ignoreCase = true) == true) {
+                "Task tracker file not found. Create a task to initialize task_tracker/tasks.json."
+            } else {
+                "Failed to load tasks: ${error.message}"
+            }
+        }
+        isLoadingTasks = false
+    }
+
+    fun refreshTaskTracker() {
+        scope.launch {
+            loadTaskTrackerInternal()
+        }
+    }
+
+    fun removeTask(task: ProjectTask) {
+        scope.launch {
+            val root = projectPath
+            if (root == null) {
+                tasksStatus = "Select a project to delete tasks."
+                return@launch
+            }
+            if (deletingTaskIds.contains(task.id)) return@launch
+            deletingTaskIds += task.id
+            val result = controller.deleteTask(root, task.id)
+            result.onSuccess {
+                tasksStatus = "Deleted task ${task.title}."
+                loadTaskTrackerInternal()
+            }.onFailure { error ->
+                tasksStatus = "Failed to delete task: ${error.message}"
+            }
+            deletingTaskIds.remove(task.id)
         }
     }
 
@@ -479,6 +539,16 @@ private fun AssistantScreen() {
                             onSuggestSolution = { issue -> suggestIssueSolution(issue) },
                         )
                     }
+                    AssistantTab.TASKS -> {
+                        TaskTrackerTabContent(
+                            tasks = projectTasks,
+                            status = tasksStatus,
+                            isLoading = isLoadingTasks,
+                            deletingTaskIds = deletingTaskIds.toSet(),
+                            onRefresh = { refreshTaskTracker() },
+                            onDeleteTask = { task -> removeTask(task) },
+                        )
+                    }
                 }
             }
         }
@@ -494,6 +564,10 @@ private fun AssistantScreen() {
 
     LaunchedEffect(projectPath) {
         loadUserIssuesInternal()
+    }
+
+    LaunchedEffect(projectPath) {
+        loadTaskTrackerInternal()
     }
 
     LaunchedEffect(autoReviewEnabled, projectPath, baseUrl, selectedChatModel, selectedEmbeddingModel) {
@@ -1110,6 +1184,116 @@ private fun UserIssuesTabContent(
     }
 }
 
+@Composable
+private fun TaskTrackerTabContent(
+    tasks: List<ProjectTask>,
+    status: String,
+    isLoading: Boolean,
+    deletingTaskIds: Set<String>,
+    onRefresh: () -> Unit,
+    onDeleteTask: (ProjectTask) -> Unit,
+) {
+    Column(Modifier.fillMaxSize()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Task tracker", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.weight(1f))
+            Button(onClick = onRefresh, enabled = !isLoading) {
+                Text("Refresh")
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(status, style = MaterialTheme.typography.bodySmall)
+        if (isLoading) {
+            Spacer(Modifier.height(12.dp))
+            CircularProgressIndicator(modifier = Modifier.size(32.dp))
+        }
+        Spacer(Modifier.height(12.dp))
+        if (tasks.isEmpty()) {
+            Text("No tasks were loaded from task_tracker/tasks.json.", style = MaterialTheme.typography.bodyMedium)
+        } else {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                items(tasks) { task ->
+                    val isDeleting = deletingTaskIds.contains(task.id)
+                    TaskCard(
+                        task = task,
+                        isDeleting = isDeleting,
+                        onDelete = { onDeleteTask(task) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TaskCard(
+    task: ProjectTask,
+    isDeleting: Boolean,
+    onDelete: () -> Unit,
+) {
+    val (priorityTextColor, priorityContainerColor) = priorityBadgeColors(task.priority)
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(task.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(4.dp))
+                    Text("ID: ${task.id}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                }
+                Spacer(Modifier.width(12.dp))
+                Surface(
+                    shape = RoundedCornerShape(50),
+                    color = priorityContainerColor,
+                    contentColor = priorityTextColor,
+                ) {
+                    Text(
+                        text = task.priority.name,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                IconButton(onClick = onDelete, enabled = !isDeleting) {
+                    Icon(Icons.Filled.Delete, contentDescription = "Delete task")
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            if (task.description.isNotBlank()) {
+                Text(task.description, style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(8.dp))
+            }
+            if (task.requirements.isNotEmpty()) {
+                Text("Requirements", style = MaterialTheme.typography.labelMedium)
+                Spacer(Modifier.height(4.dp))
+                task.requirements.forEach { requirement ->
+                    Text("- $requirement", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 4.dp))
+                }
+                Spacer(Modifier.height(8.dp))
+            }
+            Divider(color = MaterialTheme.colorScheme.outlineVariant)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = if (isDeleting) "Deleting task..." else "Ready for implementation",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (isDeleting) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+    }
+}
+
+private fun priorityBadgeColors(priority: TaskPriority): Pair<Color, Color> = when (priority) {
+    TaskPriority.CRITICAL -> Color(0xFFB71C1C) to Color(0x33B71C1C)
+    TaskPriority.HIGH -> Color(0xFFD32F2F) to Color(0x33D32F2F)
+    TaskPriority.MEDIUM -> Color(0xFFEF6C00) to Color(0x33EF6C00)
+    TaskPriority.LOW -> Color(0xFF2E7D32) to Color(0x332E7D32)
+}
 
 
 private enum class AssistantTab(val title: String) {
@@ -1117,6 +1301,7 @@ private enum class AssistantTab(val title: String) {
     MCP("MCP"),
     PRS("Pull Requests"),
     ISSUES("User Issues"),
+    TASKS("Task tracker"),
 }
 
 private fun sendCurrentMessage(
@@ -1137,6 +1322,8 @@ private fun sendCurrentMessage(
     messages += ChatMessage(MessageRole.USER, trimmed)
     setUserInput("")
 
+    val historySnapshot = messages.toList().dropLast(1)
+    val forceTaskCreation = requiresTaskCreation(trimmed)
     scope.launch {
         setStatus("Sending request to Ollama...")
         setBusy(true)
@@ -1148,6 +1335,8 @@ private fun sendCurrentMessage(
                 baseUrl = baseUrl,
                 gitBranch = gitBranch,
                 projectRoot = projectPath,
+                requireTaskCreation = forceTaskCreation,
+                history = historySnapshot,
         )
         response.onSuccess {
             messages += ChatMessage(MessageRole.ASSISTANT, it)
@@ -1159,5 +1348,12 @@ private fun sendCurrentMessage(
         }
         setBusy(false)
     }
+}
+
+private fun requiresTaskCreation(message: String): Boolean {
+    val lower = message.lowercase()
+    val createKeywords = listOf("созда", "добав", "оформи", "перенеси", "создай", "создать", "add", "create")
+    val taskKeywords = listOf("задач", "task", "таск-трек", "task tracker")
+    return createKeywords.any { lower.contains(it) } && taskKeywords.any { lower.contains(it) }
 }
 
